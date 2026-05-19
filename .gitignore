@@ -1,0 +1,5 @@
+.env
+.vnv/
+pg.py
+.DS_Store
+.vscode/
