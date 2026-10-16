@@ -1,5 +1,21 @@
+# secrets
 .env
+
+# environments / editors / OS
 .vnv/
-pg.py
-.DS_Store
+.venv/
 .vscode/
+.idea/
+.DS_Store
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# generated at runtime (anchored to the repo root so src/dagtrade/data and src/dagtrade/live are NOT ignored)
+/data/
+/runs/
+/.cache/
+/live/

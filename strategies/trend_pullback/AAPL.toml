@@ -1,0 +1,12 @@
+# daily trend gate + hourly entries. Hourly history: yfinance ~2 years; Alpaca much longer.
+start = "2025-01-01"
+benchmark = "SPY"
+holdout = 0.25
+
+[params]
+fast = 20
+slow = 50
+
+[sim]
+commission_bps = 1.0
+slippage_bps = 2.0

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dagtrade"
+version = "0.1.0"
+description = "DAG-based strategy research and backtesting platform"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy", "pandas", "numba", "pyarrow", "yfinance", "alpaca-py",
+  "python-dotenv", "fastapi", "uvicorn",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+dagtrade = "dagtrade.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+dagtrade = ["viz/static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
