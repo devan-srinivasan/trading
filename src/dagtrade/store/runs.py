@@ -61,7 +61,13 @@ class RunStore:
     def frame(self, run_id: str, name: str) -> pd.DataFrame:
         return pd.read_parquet(self.dir(run_id) / f"{name}.parquet")
 
-    def delete(self, run_id: str) -> None:
-        shutil.rmtree(self.dir(run_id), ignore_errors=True)
+    def delete(self, run_id: str) -> int:
+        """Remove a run's folder and index row. Returns the bytes freed. Only ever touches runs/<id>/."""
+        d = self.dir(run_id)
+        if not run_id or d.resolve().parent != self.root.resolve():
+            raise ValueError(f"not a run id: {run_id!r}")
+        freed = sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) if d.is_dir() else 0
+        shutil.rmtree(d, ignore_errors=True)
         with self._conn() as c:
             c.execute("DELETE FROM runs WHERE id=?", (run_id,))
+        return freed

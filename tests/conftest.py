@@ -36,9 +36,9 @@ def fixed_data(tmp_path):
     return make
 
 
-def T(signal, **kw):
+def T(**kw):
     """Trade with the required take_profit / stop_loss filled in (override via kw)."""
     from dagtrade import Trade
     kw.setdefault("take_profit", 0.10)
     kw.setdefault("stop_loss", 0.05)
-    return Trade(signal, **kw)
+    return Trade(**kw)

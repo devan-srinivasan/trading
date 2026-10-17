@@ -46,3 +46,16 @@ def test_span_for_history_loading():
     assert Range(start="-90d").span(NOW) == pd.Timedelta(days=90)
     assert Range(start="2024-06-01").span(NOW) == NOW - pd.Timestamp("2024-06-01", tz="UTC")
     assert Range().span(NOW) is None
+
+
+def test_candle_count_windows_and_the_dag_interval():
+    avail = pd.date_range("2024-01-02", periods=30, freq="D", tz="UTC")
+    opens = avail - pd.Timedelta(days=1)
+    lo, hi = Range(candles=5).bounds(opens, avail)
+    assert (hi - lo).tolist() == [1, 2, 3, 4] + [5] * 26                # the last 5 candles, fewer at the start
+    assert Range(candles=5).tf is None and Range(interval="5m").tf == "5m"
+    with pytest.raises(ValueError):
+        Range(start="-5d", candles=5)
+    # loading enough calendar time: 200 daily candles ~ 280 days; 200 five-minute candles ~ 3 sessions
+    assert Range(candles=200).span(NOW, "1d") >= pd.Timedelta(days=280)
+    assert pd.Timedelta(days=3) <= Range(candles=200).span(NOW, "5m") <= pd.Timedelta(days=12)

@@ -1,91 +1,145 @@
-import numpy as np
-import pandas as pd
+"""PaperBroker: the one set of fill rules shared by backtests and the local live engine.
+Candle i: open time = i days, closes (avail) at i+1 days. Orders sent at a close fill on the next candle."""
 import pytest
 
-from dagtrade.sim import SimConfig, simulate
-from conftest import make_bars
+from dagtrade.sim import PaperBroker
 
-ZERO = SimConfig(capital=1000.0, commission_bps=0, slippage_bps=0)
-USD = 1000.0
+DAY = 86400.0
 
 
-def intents(bars, target, stop=None, take=None, usd=USD):
-    n = len(bars)
-    return pd.DataFrame({"target": np.asarray(target, float), "usd": np.full(n, float(usd)),
-                         "stop": np.full(n, np.nan) if stop is None else np.asarray(stop, float),
-                         "take": np.full(n, np.nan) if take is None else np.asarray(take, float)}, index=bars.index)
+def candle(b, i, o, h=None, l=None, c=None):
+    h = o if h is None else h
+    l = o if l is None else l
+    c = o if c is None else c
+    b.process(i * DAY, (i + 1) * DAY, o, h, l, c)
 
 
-def test_fills_at_next_open_not_signal_close():
-    bars = make_bars([10, 11, 12, 13], [10, 11, 12, 13], [10, 11, 12, 13], [10.5, 11.5, 12.5, 13.5])
-    r = simulate(bars, intents(bars, [1, 1, 1, 1]), ZERO)
-    f = r.fills.iloc[0]
-    assert f.bar == 1 and f.price == 11          # decided at close of bar 0, filled at open of bar 1
-    # final bar liquidation at its close
-    assert r.fills.iloc[-1].reason == "end" and r.fills.iloc[-1].price == 13.5
-    assert r.fills.iloc[0].qty == pytest.approx(1000 / 11)                 # $1000 / open price
-    assert r.equity.iloc[-1] == pytest.approx(1000 + 1000 / 11 * (13.5 - 11))
+def broker(cash=10_000.0, comm=0.0, slip=0.0, whole=False):           # comm / slip in basis points
+    return PaperBroker(cash, comm, slip, whole_shares=whole)
 
 
-def test_stop_fills_at_stop_and_gap_fills_at_open():
-    # bar1 entry @10. bar2 low touches stop 9.5 -> fill 9.5.
-    bars = make_bars([10, 10, 10, 8], [10, 10.5, 10, 8], [10, 9.8, 9.0, 7.5], [10, 10, 9.4, 8])
-    r = simulate(bars, intents(bars, [1, 1, 1, 1], stop=[9.5] * 4), ZERO)
-    stops = r.fills[r.fills.reason == "stop"]
-    assert len(stops) == 1 and stops.iloc[0].price == 9.5 and stops.iloc[0].bar == 2
-    # gap: open below the stop -> fill at the open
-    bars = make_bars([10, 10, 8.0, 8], [10, 10, 8.2, 8], [10, 10, 7.5, 8], [10, 10, 8, 8])
-    r = simulate(bars, intents(bars, [1, 1, 1, 1], stop=[9.5] * 4), ZERO)
-    assert r.fills[r.fills.reason == "stop"].iloc[0].price == 8.0
+def test_market_entry_fills_at_the_next_open_not_the_signal_close():
+    b = broker()
+    candle(b, 0, 10, c=10.5)
+    b.submit_entry("buy", 100, "e1", at=1 * DAY)             # decided at candle 0's close
+    candle(b, 1, 11, c=12)
+    f = b.s["fills"][0]
+    assert (f["time"], f["price"], f["qty"]) == (1 * DAY, 11, 100)
+    assert b.cash == pytest.approx(10_000 - 1100) and b.equity(12) == pytest.approx(10_000 + 100)
 
 
-def test_stop_wins_when_bar_touches_both():
-    bars = make_bars([10, 10, 10, 10], [10, 10, 12, 10], [10, 10, 9, 10], [10, 10, 10, 10])
-    r = simulate(bars, intents(bars, [1, 1, 1, 1], stop=[9.5] * 4, take=[11.5] * 4), ZERO)
-    assert (r.fills.reason == "stop").sum() == 1 and (r.fills.reason == "take").sum() == 0
+def test_stop_fills_at_the_stop_and_a_gap_fills_at_the_open():
+    b = broker()
+    candle(b, 0, 100)
+    b.submit_entry("buy", 10, "e", at=DAY, stop=95, take=120)
+    candle(b, 1, 100, h=101, l=94)                          # entry candle already checks the legs
+    assert [f["reason"] for f in b.s["fills"]] == ["market", "stop"] and b.s["fills"][1]["price"] == 95
+    b = broker()
+    candle(b, 0, 100)
+    b.submit_entry("buy", 10, "e", at=DAY, stop=95, take=120)
+    candle(b, 1, 100)
+    candle(b, 2, 90)                                        # gapped through the stop: filled at the open
+    assert b.s["fills"][1]["price"] == 90 and b.qty == 0
 
 
-def test_no_reentry_after_stop_until_target_changes():
-    flat = [10] * 8
-    bars = make_bars(flat, flat, [10, 10, 9, 10, 10, 10, 10, 10], flat)
-    tgt = [1, 1, 1, 1, 0, 1, 1, 1]
-    r = simulate(bars, intents(bars, tgt, stop=[9.5] * 8), ZERO)
-    entries = r.fills[r.fills.qty > 0]
-    assert list(entries.bar) == [1, 6]           # initial entry, then only after target went 0 -> 1
-    assert list(r.fills[r.fills.reason == "stop"].bar) == [2]
+def test_stop_wins_when_a_candle_touches_both_and_the_other_leg_is_cancelled():
+    b = broker()
+    candle(b, 0, 100)
+    b.submit_entry("buy", 10, "e", at=DAY, stop=95, take=105)
+    candle(b, 1, 100, h=106, l=94)
+    assert b.s["fills"][1]["reason"] == "stop" and b.working() == []
+
+
+def test_take_profit_fills_at_the_target_or_better_on_a_gap():
+    b = broker()
+    candle(b, 0, 100)
+    b.submit_entry("buy", 10, "e", at=DAY, stop=90, take=110)
+    candle(b, 1, 100)
+    candle(b, 2, 115)
+    assert b.s["fills"][1]["reason"] == "take" and b.s["fills"][1]["price"] == 115
 
 
 def test_short_pnl_and_costs():
-    bars = make_bars([10, 10, 9, 8], [10, 10, 9, 8], [10, 10, 9, 8], [10, 10, 9, 8])
-    r = simulate(bars, intents(bars, [-1, -1, -1, -1]), SimConfig(capital=1000.0, commission_bps=10, slippage_bps=0))
-    t = r.trades.iloc[0]
-    assert t.side == "short" and t.entry_price == 10 and t.exit_price == 8
-    gross = 100 * 2.0
-    comm = 100 * 10 * 0.001 + 100 * 8 * 0.001                                 # 100 shares = $1000 / $10
-    assert t.pnl == pytest.approx(gross - comm)
-    assert r.equity.iloc[-1] == pytest.approx(1000 + gross - comm)
+    b = broker(cash=2000, comm=10)
+    candle(b, 0, 10)
+    b.submit_entry("sell", 100, "e", at=DAY)
+    candle(b, 1, 10)
+    b.submit_market("buy", 100, "c", at=2 * DAY)
+    candle(b, 2, 8)
+    comm = 100 * 10 * 0.001 + 100 * 8 * 0.001
+    assert b.equity(8) == pytest.approx(2000 + 200 - comm) and b.qty == 0
 
 
 def test_slippage_hurts_both_ways():
-    bars = make_bars([10, 10, 10, 10], [10] * 4, [10] * 4, [10] * 4)
-    r = simulate(bars, intents(bars, [1, 1, 1, 1]), SimConfig(capital=1000.0, commission_bps=0, slippage_bps=100))
-    assert r.equity.iloc[-1] < 1000 * 0.985
+    b = broker(slip=100)
+    candle(b, 0, 10)
+    b.submit_entry("buy", 100, "e", at=DAY)
+    candle(b, 1, 10)
+    b.submit_market("sell", 100, "c", at=2 * DAY)
+    candle(b, 2, 10)
+    assert b.equity(10) == pytest.approx(10_000 - 2 * 1000 * 0.01)        # 1% on the way in and out
 
 
-def test_sign_flip_is_two_trades():
-    bars = make_bars(list(range(10, 16)), list(range(10, 16)), list(range(10, 16)), list(range(10, 16)))
-    r = simulate(bars, intents(bars, [1, 1, -1, -1, -1, -1]), ZERO)
-    assert list(r.trades.side) == ["long", "short"]
+def test_limit_entry_fills_only_if_the_candle_trades_through_it_else_expires():
+    b = broker()
+    candle(b, 0, 100)
+    b.submit_entry("buy", 10, "e", at=DAY, limit=99)
+    candle(b, 1, 100, l=98)
+    assert b.s["fills"][0]["price"] == 99 and b.s["fills"][0]["reason"] == "limit"
+    b = broker()
+    candle(b, 0, 100)
+    b.submit_entry("buy", 10, "e", at=DAY, limit=99)
+    candle(b, 1, 100)
+    assert b.s["fills"] == [] and b.status("e") == "expired"
 
 
-def test_trade_from_blocks_early_signals():
-    bars = make_bars([10] * 6, [10] * 6, [10] * 6, [10] * 6)
-    r = simulate(bars, intents(bars, [1] * 6), ZERO, trade_from=bars.index[3])
-    assert r.fills.iloc[0].bar == 3              # earliest: open of the first allowed bar
+def test_no_borrowing_entries_are_cut_to_the_cash_or_rejected():
+    b = broker(cash=1000)
+    candle(b, 0, 10)
+    b.submit_entry("buy", 400, "e", at=DAY)                 # $4000 order, $1000 account
+    candle(b, 1, 10)
+    assert b.s["fills"][0]["qty"] == pytest.approx(100)
+    b = broker(cash=1000, comm=10)
+    candle(b, 0, 10)
+    b.submit_entry("buy", 100, "e", at=DAY)
+    candle(b, 1, 10)
+    f = b.s["fills"][0]
+    assert f["qty"] * f["price"] + f["fee"] == pytest.approx(1000) and f["qty"] < 100      # the fee must fit too
+    b = broker(cash=150, whole=True)
+    candle(b, 0, 100)
+    b.submit_entry("buy", 3, "e", at=DAY)
+    candle(b, 1, 100)
+    assert b.s["fills"][0]["qty"] == 1                                                     # whole shares only
+    b = broker(cash=50, whole=True)
+    candle(b, 0, 100)
+    b.submit_entry("buy", 1, "e", at=DAY)
+    candle(b, 1, 100)
+    assert b.s["fills"] == [] and b.status("e") == "rejected"
 
 
-def test_position_size_is_the_dollar_amount_not_a_share_of_equity():
-    bars = make_bars([10, 10, 10, 10], [10] * 4, [10] * 4, [10] * 4)
-    for usd in (250.0, 4000.0):
-        r = simulate(bars, intents(bars, [1, 1, 1, 1], usd=usd), ZERO)
-        assert r.fills.iloc[0].qty == pytest.approx(usd / 10)
+def test_a_close_never_flips_the_position_and_duplicate_client_ids_are_refused():
+    b = broker()
+    candle(b, 0, 100)
+    b.submit_entry("buy", 10, "e", at=DAY)
+    candle(b, 1, 100)
+    b.submit_market("sell", 25, "c", at=2 * DAY)
+    candle(b, 2, 100)
+    assert b.qty == 0
+    with pytest.raises(ValueError, match="unique"):
+        b.submit_market("sell", 1, "c", at=3 * DAY)
+
+
+def test_trailing_stop_moves_and_flatten_closes_at_the_last_price():
+    b = broker()
+    candle(b, 0, 100)
+    b.submit_entry("buy", 10, "e", at=DAY, stop=95)
+    candle(b, 1, 100)
+    b.replace_stop(None, 99)
+    candle(b, 2, 100, l=98.5)
+    assert b.s["fills"][1]["price"] == 99
+    b = broker()
+    candle(b, 0, 100)
+    b.submit_entry("buy", 10, "e", at=DAY)
+    candle(b, 1, 100, c=104)
+    b.flatten(at=2 * DAY, reason="end")
+    assert b.qty == 0 and b.s["fills"][-1]["price"] == 104 and b.s["fills"][-1]["reason"] == "end"

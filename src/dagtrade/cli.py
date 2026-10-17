@@ -9,11 +9,13 @@
   dagtrade dash                         open the dashboard
   dagtrade report RUN_ID                standalone HTML report
 
-  dagtrade live check                   verify Alpaca paper keys + show what each live strategy would do right now
-  dagtrade live once|run [--dry-run]    one scan cycle / the always-on scanner that trades the paper account
-  dagtrade live status|pause|resume     see state, stop sending orders, start again
-  dagtrade live flatten [x/AAPL]        cancel our orders + close positions (then pauses)
-  dagtrade serve [--dry-run]            dashboard AND always-on scanner in one process
+  dagtrade live add x/AAPL [--interval 5m] [--flat-by-close] [--mode local|alpaca]   make a DAG live (local paper by default)
+  dagtrade live list|start|stop|remove|mode ID                     manage live DAGs (ids like x/AAPL@5m)
+  dagtrade live restart ID [--start-at STATE]                     restart a live DAG's state machine
+  dagtrade live check | once | run [--dry-run]                     show decisions / one scan / the always-on scanner
+  dagtrade live status|pause|resume|flatten                        state, stop sending orders, close everything
+  dagtrade serve [--dry-run]                                       dashboard AND always-on scanner in one process
+  dagtrade logs [all|errors|backtest|live|data|server|activity] [-n 50] [--level WARNING] [--grep x] [-f]
 """
 from __future__ import annotations
 
@@ -101,31 +103,72 @@ def cmd_data(a):
         print(f"{t.upper()} {a.tf}: {len(df)} bars  {df.index[0]} -> {df.index[-1]}")
 
 
+class _Bars:
+    """Terminal progress: one bar over all runs, one bar for the node currently walking its candles."""
+
+    def __init__(self, total: int):
+        from tqdm import tqdm
+        self.tqdm = tqdm
+        self.outer = tqdm(total=total, desc="backtests", unit="run", position=0, dynamic_ncols=True,
+                          bar_format="{desc} {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} runs [{elapsed}<{remaining}]")
+        self.inner, self.node = None, None
+
+    def start(self, label: str):
+        self.outer.set_description(f"backtests  {label}")
+
+    def node_progress(self, name: str, done: int, total: int):
+        if self.node != name or self.inner is None:
+            if self.inner is not None:
+                self.inner.close()
+            self.node = name
+            self.inner = self.tqdm(total=total, desc=f"  {name}", unit="candle", position=1, leave=False,
+                                   dynamic_ncols=True, unit_scale=True)
+        self.inner.update(done - self.inner.n)
+
+    def done(self, text: str):
+        if self.inner is not None:
+            self.inner.close()
+            self.inner, self.node = None, None
+        self.outer.write(text)
+        self.outer.update(1)
+
+    def close(self):
+        self.outer.set_description("backtests")
+        self.outer.close()
+
+
 def cmd_run(a):
     from .runner import run_deployment
     deps = discover_deployments() if a.all else [resolve(t) for t in a.targets]
-    for dep in deps:
-        if a.start:
-            dep.start = a.start
-        try:
-            out = run_deployment(dep, cache=not a.no_cache, check_causal=a.check)
-        except Exception as e:  # noqa: BLE001
-            print(f"\n== {dep.label}: FAILED - {e}")
-            if a.verbose:
-                raise
-            continue
-        print(fmt_run(out))
+    bars = _Bars(len(deps))
+    try:
+        for dep in deps:
+            if a.start:
+                dep.start = a.start
+            bars.start(dep.label)
+            try:
+                out = run_deployment(dep, cache=not a.no_cache, check_causal=a.check, progress=bars.node_progress)
+            except Exception as e:  # noqa: BLE001
+                logging.getLogger("dagtrade.run").exception("backtest %s failed", dep.label)
+                bars.done(f"\n== {dep.label}: FAILED - {e}")
+                if a.verbose:
+                    raise
+                continue
+            bars.done(fmt_run(out))
+    finally:
+        bars.close()
 
 
 def cmd_check(a):
     from .data import DataSource
-    from .graph import verify_causal
-    from .runner import build_graph
+    from .fsa import verify_causal
+    from .runner import build_fsa
     for t in a.targets:
         dep = resolve(t)
-        g, _ = build_graph(dep)
-        start = dep.start_ts() - pd.Timedelta(days=dep.warmup_days)
-        rep = verify_causal(g, DataSource(), dep.ticker, start, dep.end_ts(), base_tf=dep.base_tf)
+        fsa, _ = build_fsa(dep)
+        rep = verify_causal(lambda: build_fsa(dep)[0], DataSource(), dep.ticker, dep.start_ts(), dep.end_ts(),
+                            base_tf=dep.base_tf, cfg=dep.sim_config(), inputs=dep.inputs,
+                            flat_by_close=dep.flat_by_close, data_start=dep.data_start(fsa))
         print(f"{dep.label}: {rep}")
 
 
@@ -153,25 +196,39 @@ def cmd_new(a):
 
 
 TEMPLATE = '''"""{name}: describe the idea in one paragraph."""
-from dagtrade import Graph, Node, Range, Trade
-from dagtrade.indicators import rsi
+from dagtrade import FSA, Node, Range, Trade
+from dagtrade.indicators import rsi, sma
 
 DESCRIPTION = "What this strategy does, in plain English."
 DEFAULTS = dict(rsi_buy=30, take_profit=0.08, stop_loss=0.04)
 
 
+class Uptrend(Node):
+    """State 1: wait until the close is above its 50-candle average."""
+    history = Range(candles=60)          # the last 60 candles of the interval you run on (or Range(start="-60d", interval="d"))
+
+    def run(self, candles, ctx):
+        if len(candles) >= 50 and candles.close.iloc[-1] > sma(candles.close, 50).iloc[-1]:
+            return True                  # success -> the next state
+        return None                      # not yet: ask again next candle
+
+
 class OversoldBounce(Node):
-    history = Range(start="-60d", interval="d")          # the candles this node looks at (any interval: m 5m h d w)
+    """State 2: within 10 candles, wait for RSI(3) to dip below rsi_buy; then buy."""
+    history = Range(candles=20)
+    max_wait = 10                        # gave up waiting -> back to the start
 
     def __init__(self, rsi_buy, **kw):
         super().__init__(rsi_buy=rsi_buy, **kw)           # becomes self.rsi_buy
 
-    def run(self, candles, upstream):                     # candles in ...
-        return {{"buy": bool(rsi(candles.close, 3).iloc[-1] < self.rsi_buy)}}    # ... structured data out
+    def run(self, candles, ctx):
+        if rsi(candles.close, 3).iloc[-1] < self.rsi_buy:
+            return {{"buy": True}}                         # the Trade state places this order
+        return None
 
 
 def build(rsi_buy, take_profit, stop_loss):
-    return Graph(Trade(OversoldBounce(rsi_buy), take_profit=take_profit, stop_loss=stop_loss))
+    return FSA.chain(Uptrend(), OversoldBounce(rsi_buy), Trade(take_profit=take_profit, stop_loss=stop_loss))
 '''
 
 
@@ -188,79 +245,108 @@ def cmd_report(a):
 
 
 # ---------------------------------------------------------------------------------------------
-def _live_deployments(only=None):
-    deps = [d for d in discover_deployments() if d.live.get("enabled")]
-    if only:
-        deps = [d for d in deps if d.label in only]
-    return deps
+def _registry():
+    from .live import Registry, live_dir
+    return Registry(live_dir())
 
 
 def _make_runner(a, charts=True):
     from .live import AlpacaBroker, DryRunBroker, LiveRunner
-    deps = _live_deployments(getattr(a, "only", None))
-    if not deps:
-        raise SystemExit("no live deployments: add a [live] section with enabled = true to a strategy TOML "
-                         "(see strategies/wick_reversal/AAPL.toml)")
-    broker = AlpacaBroker()
-    if getattr(a, "dry_run", False):
-        broker = DryRunBroker(broker)
-    return LiveRunner(deps, broker, charts=charts)
+
+    def alpaca():
+        b = AlpacaBroker()
+        return DryRunBroker(b) if getattr(a, "dry_run", False) else b
+    return LiveRunner(registry=_registry(), alpaca_factory=alpaca, charts=charts)
 
 
 def cmd_live(a):
-    from .live import live_dir
+    from .live import Journal, live_dir
+    reg = _registry()
+    args = a.args
+    if a.sub == "add":
+        if not args or "/" not in args[0]:
+            raise SystemExit("usage: dagtrade live add STRATEGY/TICKER [--interval 5m] [--flat-by-close] [--mode local|alpaca]")
+        strat, tick = args[0].split("/", 1)
+        try:
+            e = reg.add(strat, tick, a.interval, a.mode, flat_by_close=a.flat_by_close, start_at=a.start_at)
+        except ValueError as ex:
+            raise SystemExit(str(ex))
+        print(f"added {e['id']} ({e['mode']} paper, ${e['cash']:,.0f}). It starts on the scanner's next cycle "
+              f"(dagtrade serve, or dagtrade live run).")
+        return
+    if a.sub == "restart":
+        if not args:
+            raise SystemExit("usage: dagtrade live restart DAG_ID [--start-at STATE]")
+        try:
+            reg.request_restart(args[0], a.start_at)
+        except (KeyError, ValueError) as ex:
+            raise SystemExit(str(ex))
+        print(f"{args[0]}: restarts at {a.start_at or 'the start state'} on the scanner's next cycle")
+        return
+    if a.sub in ("start", "stop", "remove", "mode"):
+        if not args:
+            raise SystemExit(f"usage: dagtrade live {a.sub} DAG_ID" + (" local|alpaca" if a.sub == "mode" else ""))
+        try:
+            if a.sub == "remove":
+                reg.remove(args[0])
+            elif a.sub == "mode":
+                reg.update(args[0], mode=args[1] if len(args) > 1 else None)
+            else:
+                reg.update(args[0], status="running" if a.sub == "start" else "stopped")
+        except (KeyError, ValueError, IndexError) as ex:
+            raise SystemExit(f"{a.sub} failed: {ex}")
+        Journal().add(args[0], "note", f"{a.sub} (CLI)")
+        print(f"{a.sub}: {args[0]}")
+        return
+    if a.sub == "list":
+        items = reg.load()
+        if not items:
+            print("no live DAGs. Add one: dagtrade live add stochastic/SPY --interval 5m")
+        for e in items:
+            print(f"  {e['status']:<8} {e['mode']:<7} {e['id']}")
+        return
     if a.sub == "status":
-        import json
         p = live_dir() / "status.json"
         if not p.exists():
-            raise SystemExit("no status yet - the runner has not completed a cycle (dagtrade live run)")
+            raise SystemExit("no status yet - the scanner has not completed a cycle (dagtrade serve / live run)")
         st = json.loads(p.read_text())
         age = time.time() - (st.get("heartbeat") or 0)
-        print(f"mode {st.get('mode')}  heartbeat {age:.0f}s ago {'(RUNNER NOT RUNNING?)' if age > 120 else ''}  "
-              f"paused={st.get('paused')}")
-        if st.get("account"):
-            ac = st["account"]
-            print(f"account equity ${ac['equity']:,.0f}  cash ${ac['cash']:,.0f}  market {'OPEN' if st['clock']['is_open'] else 'closed'}")
+        clk = st.get("clock") or {}
+        print(f"scanner heartbeat {age:.0f}s ago {'(NOT RUNNING?)' if age > 120 else ''}  paused={st.get('paused')}  "
+              f"market {'OPEN' if clk.get('is_open') else 'closed'}")
         for d in st.get("deployments", []):
-            dec = d.get("decision") or {}
-            print(f"  {d['label']:<28} bar {d.get('last_bar','-')}  wants {dec.get('target', 0):+.0f} (${dec.get('usd', 0):,.0f})  "
-                  f"position {d.get('position', 0):+.0f}  {d.get('last_action', {}) and d['last_action']['text'] or ''}"
-                  f"{'  ERROR ' + d['last_error'] if d.get('last_error') else ''}")
-        from .live import Journal
+            ac = d.get("account") or {}
+            print(f"  {d['label']:<30} {d.get('mode', ''):<7} bar {d.get('last_bar', '-')}  position {d.get('position', 0) or 0:+g}  "
+                  f"step {d.get('current_step', '-')}  P&L {ac.get('realized', 0) or 0:+.2f}"
+                  f"{'  ERROR ' + d['error'] if d.get('error') else ''}")
         print("\nrecent journal:")
         for r in Journal().tail(10)[::-1]:
-            print(f"  {r['ts'][5:19]}  {r['label']:<22} {r['type']:<9} {r['text']}")
+            print(f"  {r['ts'][5:19]}  {r['label']:<24} {r['type']:<9} {r['text']}")
         return
     if a.sub in ("pause", "resume"):
-        from .live import Journal
         p = live_dir() / "PAUSED"
         p.touch() if a.sub == "pause" else p.unlink(missing_ok=True)
-        Journal().add("*", "note", "PAUSED from CLI" if a.sub == "pause" else "resumed from CLI (fresh baseline)")
+        Journal().add("*", "note", "PAUSED from CLI" if a.sub == "pause" else "resumed from CLI")
         print("paused: no orders will be sent" if a.sub == "pause" else "resumed")
         return
     if a.sub == "flatten":
         return _flatten(a)
     r = _make_runner(a, charts=a.sub != "check")
     if a.sub == "check":
-        ac, ck = r.broker.account(), r.broker.clock()
-        print(f"Alpaca [{r.broker.name}] OK  equity ${ac.equity:,.2f}  buying power ${ac.buying_power:,.2f}  "
-              f"market {'OPEN' if ck.is_open else 'closed'} (next open {ck.next_open:%a %H:%M})")
-        pos = r.broker.positions()
-        print(f"open positions: {pos or 'none'}")
-        from .live import compute_decision
+        from .live import stages
+        r._sync_registry()
+        if not r.items:
+            raise SystemExit("no running live DAGs (dagtrade live add ...)")
         for li in r.items:
-            try:
-                d = compute_decision(li, pd.Timestamp.now(tz="UTC"))
-                print(f"\n{li.label}  [{li.base_tf}] order size ${d.usd:,.0f}  feed {li.settings.feed}\n"
-                      f"  last closed candle {pd.Timestamp(d.avail, unit='s', tz='UTC'):%Y-%m-%d %H:%M}Z  price {d.price:.2f}\n"
-                      f"  trade node wants: {d.target:+.0f}  new order now: {d.entry}  stop {d.stop}  take {d.take}\n"
-                      f"  nodes: {d.nodes}")
-            except Exception as e:  # noqa: BLE001
-                print(f"\n{li.label}: could not compute a decision - {e}")
+            snap = li.runner.snapshot()
+            print(f"\n{li.label}  [{li.mode}, {li.base_tf}]  feed {li.settings.feed}\n"
+                  f"  active state: {snap['current']} (waited {snap['waited']} candles"
+                  f"{', max ' + str(snap['max_wait']) if snap['max_wait'] else ''})\n"
+                  f"  states: " + "  ->  ".join(f"{x['name']} [{x['state']}]" for x in stages(li)))
         return
     if a.sub == "once":
         st = r.cycle()
-        print(json.dumps(st, indent=1, default=str) if a.verbose else f"cycle done: {len(st.get('deployments', []))} deployments")
+        print(json.dumps(st, indent=1, default=str) if a.verbose else f"cycle done: {len(st.get('deployments', []))} DAGs")
         return
     if a.sub == "run":
         _install_signal_stop(r)
@@ -272,38 +358,57 @@ def _install_signal_stop(r):
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
-    print(f"live runner started [{r.broker.name}] - Ctrl+C to stop. Orders go to your Alpaca PAPER account.")
+    print("live scanner started - Ctrl+C to stop. Local DAGs paper trade here; Alpaca DAGs use your Alpaca PAPER account.")
     r.run_forever(stop)
 
 
 def _flatten(a):
-    from .live import AlpacaBroker, Journal
+    """Close every live DAG: stop it (a local DAG closes its position), and for Alpaca DAGs cancel + close at Alpaca."""
+    from .live import AlpacaBroker, Journal, live_dir
     from .live.models import slug
-    broker = AlpacaBroker()
-    deps = _live_deployments(a.only or None) or discover_deployments()
-    pos = broker.positions()
-    for d in deps:
-        sym = d.ticker
-        pre = f"dt.{slug(d.label)}."
-        mine = [o for o in broker.open_orders(sym) if o.client_id.startswith(pre)]
-        for o in mine:
-            broker.cancel(o.id)
-        q = pos.get(sym, 0.0)
-        if mine:
-            time.sleep(2)
-        if q:
-            broker.submit_market(sym, "sell" if q > 0 else "buy", int(abs(q)), f"{pre}cls.flatten{int(time.time())}")
-        Journal().add(d.label, "action", f"FLATTEN: cancelled {len(mine)} orders, closing {q:+.0f} {sym}")
-        print(f"{d.label}: cancelled {len(mine)} orders, closing {q:+.0f} {sym}")
-    from .live import live_dir
+    reg = _registry()
+    items = [e for e in reg.load() if not a.args or e["id"] in a.args]
+    alpaca = None
+    for e in items:
+        if e["mode"] == "alpaca":
+            alpaca = alpaca or AlpacaBroker()
+            sym = e["ticker"]
+            pre = f"dt.{slug(e['id'])}."
+            mine = alpaca.open_orders(sym)
+            for o in mine:
+                alpaca.cancel(o.id)
+            if mine:
+                time.sleep(2)
+            q = alpaca.positions().get(sym, 0.0)
+            if q:
+                alpaca.submit_market(sym, "sell" if q > 0 else "buy", int(abs(q)), f"{pre}cls.flatten{int(time.time())}")
+            print(f"{e['id']}: cancelled {len(mine)} Alpaca orders, closing {q:+.0f} {sym}")
+        reg.update(e["id"], status="stopped")
+        Journal().add(e["id"], "action", "FLATTEN (CLI): stopped" + (" and closed at Alpaca" if e["mode"] == "alpaca" else ""))
     (live_dir() / "PAUSED").touch()
-    print("runner paused (dagtrade live resume to re-enable)")
+    print("stopped those DAGs and paused the scanner (dagtrade live resume to re-enable). "
+          "Local DAGs close their positions on the scanner's next cycle.")
+
+
+def cmd_logs(a):
+    from .logs import FILES, log_dir, read_logs
+    if a.follow:
+        import subprocess
+        f = log_dir() / FILES.get(a.area, FILES["all"])
+        print(f"following {f} (Ctrl+C to stop)")
+        subprocess.call(["tail", "-n", str(a.n), "-F", str(f)])
+        return
+    rows = read_logs(a.area, a.n, a.level, a.grep or "")
+    if not rows:
+        print(f"no {a.area} log entries at {a.level}+ (files are in {log_dir()})")
+    for r in rows[::-1]:
+        print(f"{r['time']}  {r['level']:<7}  {r['logger']:<20}  {r['message']}")
 
 
 def cmd_serve(a):
     import os
     import uvicorn
-    if not a.no_live and _live_deployments():
+    if not a.no_live:
         os.environ["DAGTRADE_LIVE"] = "1"
         os.environ["DAGTRADE_DRYRUN"] = "1" if a.dry_run else "0"
     print(f"dashboard on http://{a.host}:{a.port}" + ("  (live scanner ON)" if os.environ.get("DAGTRADE_LIVE") == "1" else ""))
@@ -329,13 +434,24 @@ def main(argv=None):
     p = sub.add_parser("dash"); p.add_argument("--host", default="127.0.0.1"); p.add_argument("--port", type=int, default=8765)
     p.set_defaults(fn=cmd_dash)
     p = sub.add_parser("report"); p.add_argument("run_id"); p.add_argument("--out"); p.set_defaults(fn=cmd_report)
-    p = sub.add_parser("live"); p.add_argument("sub", choices=["check", "once", "run", "status", "pause", "resume", "flatten"])
-    p.add_argument("only", nargs="*", help="limit to these deployments, e.g. wick_reversal/AAPL")
-    p.add_argument("--dry-run", action="store_true", help="read the real account but only LOG the orders"); p.set_defaults(fn=cmd_live)
+    p = sub.add_parser("live"); p.add_argument("sub", choices=["add", "list", "start", "stop", "remove", "mode", "check",
+                                                               "once", "run", "status", "pause", "resume", "flatten",
+                                                               "restart"])
+    p.add_argument("--start-at", help="`add` / `restart`: begin at this state instead of the start state")
+    p.add_argument("args", nargs="*", help="e.g. stochastic/SPY (add) or a DAG id like stochastic/SPY@5m")
+    p.add_argument("--interval", help="candle interval for `add`, e.g. 5m"); p.add_argument("--mode", default="local", choices=["local", "alpaca"])
+    p.add_argument("--flat-by-close", action=argparse.BooleanOptionalAction, default=None,
+                   help="`add`: day trade (out before 16:00 ET); default: whatever the ticker's TOML says")
+    p.add_argument("--dry-run", action="store_true", help="Alpaca DAGs: read the real account but only LOG the orders"); p.set_defaults(fn=cmd_live)
+    p = sub.add_parser("logs"); p.add_argument("area", nargs="?", default="all",
+                                                choices=["all", "errors", "backtest", "live", "data", "server", "activity"])
+    p.add_argument("-n", type=int, default=50); p.add_argument("--level", default="INFO", choices=["INFO", "WARNING", "ERROR"])
+    p.add_argument("--grep"); p.add_argument("-f", "--follow", action="store_true"); p.set_defaults(fn=cmd_logs)
     p = sub.add_parser("serve"); p.add_argument("--host", default="127.0.0.1"); p.add_argument("--port", type=int, default=8765)
     p.add_argument("--no-live", action="store_true"); p.add_argument("--dry-run", action="store_true"); p.set_defaults(fn=cmd_serve)
     a = ap.parse_args(argv)
-    logging.basicConfig(level=logging.INFO if a.verbose else logging.WARNING, format="%(levelname)s %(message)s")
+    from .logs import setup_logging
+    setup_logging(verbose=a.verbose)
     if a.cmd == "run" and not a.all and not a.targets:
         ap.error("give a deployment (e.g. wick_reversal/AAPL) or --all")
     a.fn(a)

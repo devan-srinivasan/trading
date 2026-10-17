@@ -1,0 +1,7 @@
+# Day trading on 5-minute candles: flat before every close. Yahoo serves ~60 days of 5m history;
+# with Alpaca keys you can set start a year back.
+start = "2026-08-25"
+flat_by_close = true
+
+[params]
+stop_loss = 0.02

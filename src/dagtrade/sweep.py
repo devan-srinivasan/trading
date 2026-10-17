@@ -35,9 +35,12 @@ def parse_grid(items: list[str]) -> dict[str, list]:
 
 def sweep(dep: Deployment, grid: dict[str, list], data: DataSource | None = None) -> pd.DataFrame:
     data = data or DataSource()
+    from tqdm import tqdm
     keys = list(grid)
     rows = []
-    for combo in itertools.product(*grid.values()):
+    combos = list(itertools.product(*grid.values()))
+    log.info("sweep %s: %d combinations of %s", dep.label, len(combos), grid)
+    for combo in tqdm(combos, desc="sweep", unit="combo", dynamic_ncols=True):
         params = dict(zip(keys, combo))
         try:
             out = run_deployment(dep, data=data, params=params, save=False)

@@ -21,6 +21,28 @@ class Provider(Protocol):
     def fetch(self, ticker: str, tf: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame: ...
 
 
+_KEY_NAMES = ("ALPACA_KEY", "APCA_API_KEY_ID", "APCA-API-KEY-ID")
+_SECRET_NAMES = ("ALPACA_SECRET", "APCA_API_SECRET_KEY", "APCA-API-SECRET-KEY")
+
+
+def alpaca_keys() -> tuple[str | None, str | None]:
+    """Alpaca key id + secret from the environment / .env, under any of the common names."""
+    try:
+        from dotenv import dotenv_values, find_dotenv
+        from .source import project_root
+        file_vals = dotenv_values(project_root() / ".env")
+    except Exception:  # noqa: BLE001
+        file_vals = {}
+
+    def pick(names):
+        for n in names:
+            v = os.getenv(n) or file_vals.get(n)
+            if v:
+                return v.strip()
+        return None
+    return pick(_KEY_NAMES), pick(_SECRET_NAMES)
+
+
 def _clean(df: pd.DataFrame, tf: str) -> pd.DataFrame:
     df = df[OHLCV].astype(float).dropna(subset=["open", "high", "low", "close"])
     df = df[~df.index.duplicated(keep="last")].sort_index()
@@ -69,11 +91,12 @@ class AlpacaProvider:
     name = "alpaca"
 
     def __init__(self, key: str | None = None, secret: str | None = None, feed: str | None = None):
-        self.key = key or os.getenv("ALPACA_KEY")
-        self.secret = secret or os.getenv("ALPACA_SECRET")
+        k, sec = alpaca_keys()
+        self.key = key or k
+        self.secret = secret or sec
         self.feed = (feed or os.getenv("ALPACA_FEED") or "sip").lower()
         if not (self.key and self.secret):
-            raise RuntimeError("ALPACA_KEY / ALPACA_SECRET not set")
+            raise RuntimeError("Alpaca keys not found: set ALPACA_KEY and ALPACA_SECRET in .env (see .env.example)")
 
     def fetch(self, ticker, tf, start, end):
         from alpaca.data.historical import StockHistoricalDataClient

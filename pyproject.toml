@@ -9,7 +9,7 @@ description = "DAG-based strategy research and backtesting platform"
 requires-python = ">=3.11"
 dependencies = [
   "numpy", "pandas", "numba", "pyarrow", "yfinance", "alpaca-py",
-  "python-dotenv", "fastapi", "uvicorn",
+  "python-dotenv", "fastapi", "uvicorn", "tqdm",
 ]
 
 [project.optional-dependencies]

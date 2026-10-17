@@ -1,4 +1,4 @@
-"""End-to-end: deployment -> graph -> simulate -> analyse -> save."""
+"""End-to-end: deployment -> FSA -> backtest (fills) -> ledger (metrics) -> save."""
 from __future__ import annotations
 
 import logging
@@ -8,35 +8,55 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-from . import tf as tfm
-from .analytics import daily_equity, equity_stats, random_timing_baseline, relative_stats, split_stats, trade_stats
+from .analytics.ledger import LedgerReport, ledger_report
 from .config import Deployment, load_strategy
 from .data import DataSource
-from .graph import Graph, GraphResult, asof_align, verify_causal
-from .sim import SimResult, simulate
+from .fsa import FSA, BacktestResult, Trade, backtest, verify_causal
+from .fsa.node import _check_pct
 from .store import RunStore
 
 log = logging.getLogger("dagtrade.run")
+PCT_ACCOUNT_CASH = 10_000.0          # starting cash of a backtest whose Trade sizes orders as % of the account
+
+
+class Cancelled(Exception):
+    """A backtest was stopped by the user (see run_deployment's `cancel`)."""
 
 
 @dataclass
 class RunOutput:
     run_id: str
     deployment: Deployment
-    graph_result: GraphResult
-    sim: SimResult
+    result: BacktestResult             # fills, transitions, trace
+    ledger: LedgerReport               # everything computed from the fills
     metrics: dict
     insights: list[str]
     meta: dict
 
 
-def build_graph(dep: Deployment, params: dict | None = None) -> tuple[Graph, dict]:
+def build_fsa(dep: Deployment, params: dict | None = None) -> tuple[FSA, dict]:
+    """The deployment's strategy as an FSA, with its parameters (DEFAULTS < TOML [params] < `params`)."""
     mod = load_strategy(dep.strategy, root=dep.path.parent.parent.parent if dep.path else None)
     p = {**getattr(mod, "DEFAULTS", {}), **dep.params, **(params or {})}
-    g = mod.build(**p)
-    g.name = dep.strategy
-    g.params = p
-    return g, p
+    fsa = mod.build(**p)
+    if not isinstance(fsa, FSA):
+        raise TypeError(f"strategies/{dep.strategy}/strategy.py: build() must return an FSA "
+                        f"(e.g. FSA.chain(entry, Trade(...))), got {type(fsa).__name__}")
+    fsa.name, fsa.params = dep.strategy, p
+    if dep.size is not None:                          # % of the account per order, for any strategy
+        for n in fsa.nodes.values():
+            if isinstance(n, Trade):
+                n.size = n.params["size"] = _check_pct(float(dep.size))
+    if dep.flat_by_close:                             # checked here so a bad combination fails before any work
+        from . import tf as tfm
+        _, base = fsa.resolve_tfs(dep.base_tf)
+        if not tfm.is_intraday(base):
+            raise ValueError(f"flat by close needs intraday candles (e.g. 5m, 1h), not {base}")
+    return fsa, p
+
+
+def _trade_states(fsa: FSA) -> list[Trade]:
+    return [n for n in fsa.nodes.values() if isinstance(n, Trade)]
 
 
 def _daily_close(data: DataSource, symbol: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
@@ -44,14 +64,6 @@ def _daily_close(data: DataSource, symbol: str, start: pd.Timestamp, end: pd.Tim
     s = df["close"].copy()
     s.index = pd.DatetimeIndex(s.index.tz_convert("UTC").tz_localize(None).normalize())
     return s
-
-
-def _rebase(series: pd.Series, dates: pd.DatetimeIndex, capital: float) -> pd.Series:
-    """Buy-and-hold curve on `dates`, starting at `capital` (uses the last close before the first date as entry)."""
-    s = series.reindex(series.index.union(dates)).ffill()
-    before = series[series.index < dates[0]]
-    base = before.iloc[-1] if len(before) else s.loc[dates[0]]
-    return (s.loc[dates] / base * capital).rename(series.name)
 
 
 def insights_for(m: dict, dep: Deployment) -> list[str]:
@@ -101,10 +113,12 @@ def _as_series_kind(s: pd.Series):
     return None
 
 
-def node_frame(gr: GraphResult, base_grid: pd.DatetimeIndex, close: pd.Series) -> tuple[pd.DataFrame, dict]:
-    """Every node's structured output flattened to plottable columns (`node.key`) on the base candle grid."""
+def node_frame(fsa: FSA, trace: pd.DataFrame, close: pd.Series) -> tuple[pd.DataFrame, dict]:
+    """What the FSA was doing on every candle, as plottable columns: the active state (a pane), every state's output
+    while it is remembered (`state.key`; prices are drawn on the chart), and the open position's stop / take."""
     cols, info = {}, {}
     med_close = float(np.nanmedian(close.to_numpy())) if len(close) else 1.0
+    idx = trace.index
 
     def add(name, node_name, kind, vals, labels=None, place=None):
         if len(cols) >= 80:
@@ -117,104 +131,118 @@ def node_frame(gr: GraphResult, base_grid: pd.DatetimeIndex, close: pd.Series) -
         if labels:
             info[name]["labels"] = labels
 
-    for n in gr.order:
-        nm = gr.names[id(n)]
-        if n.kind == "trade" or n.plot == "hidden":
+    order = list(fsa.order)
+    if len(trace):
+        add("fsa.state", "fsa", "cat", trace["state"].map(lambda v: float(order.index(v)) if v in order else np.nan),
+            labels=order)
+    rows = list(trace["values"]) if len(trace) else []
+    for name in order:
+        if isinstance(fsa.nodes[name], Trade) or fsa.nodes[name].plot == "hidden":
             continue
-        out = asof_align(gr.out(n), gr.ctx.grid(gr.tfs[id(n)]), base_grid)
-        rows = [d if isinstance(d, dict) else {} for d in out]
-        keys = list(dict.fromkeys(k for d in rows for k in d))
+        outs = [(r.get(name) if isinstance(r.get(name), dict) else {}) for r in rows]
+        keys = list(dict.fromkeys(k for d in outs for k in d))
         for k in keys:
-            col = pd.Series([d.get(k) for d in rows], index=base_grid, dtype=object)
-            got = _as_series_kind(col)
-            if got:
-                add(f"{nm}.{k}", nm, got[0], got[1], got[2])
-    t = gr.intents                                          # the Trade node's stop / take-profit levels
+            got = _as_series_kind(pd.Series([d.get(k) for d in outs], index=idx, dtype=object))
+            if got and got[0] != "bool":                  # a remembered output exists only after success: flags
+                add(f"{name}.{k}", name, got[0], got[1], got[2])      # like "buy" are always true there
     for k in ("stop", "take"):
-        if t[k].notna().any():
-            add(f"trade.{k}", gr.names[id(gr.graph.trader)], "num", t[k], place="overlay")
-    return pd.DataFrame(cols, index=base_grid), info
+        if len(trace) and trace[k].notna().any():
+            add(f"trade.{k}", "trade", "num", trace[k].astype(float), place="overlay")
+    return pd.DataFrame(cols, index=idx), info
 
 
 def run_deployment(dep: Deployment, data: DataSource | None = None, store: RunStore | None = None,
                    params: dict | None = None, save: bool = True, cache: bool = True,
                    check_causal: bool = False, run_id: str | None = None,
-                   extra_meta: dict | None = None) -> RunOutput:
+                   extra_meta: dict | None = None, progress=None, cancel=None) -> RunOutput:
+    """progress: callback(stage, done, total). cancel: a threading.Event; once set, the run stops at the next
+    check (between download chunks, every 500 candles of the replay, before scoring, before saving) by raising
+    Cancelled, and nothing is saved. (`cache` is accepted for compatibility; FSA replays are not cached.)"""
+    import time as _time
+    t0 = _time.time()
     data = data or DataSource()
-    graph, p = build_graph(dep, params)
+    if cancel is not None:
+        def check():
+            if cancel.is_set():
+                raise Cancelled(f"backtest {dep.label} cancelled")
+
+        def progress(name, done, total, _inner=progress):
+            check()
+            if _inner:
+                _inner(name, done, total)
+    else:
+        def check():
+            return None
+    data.on_chunk = progress
+    fsa, p = build_fsa(dep, params)
     start, end = dep.start_ts(), dep.end_ts()
-    data_start = start - max(pd.Timedelta(days=dep.warmup_days), graph.required_history(start))
-    gr = graph.run(data, dep.ticker, data_start, end, base_tf=dep.base_tf, cache=cache)
-    base_tf = gr.base_tf
-    bars, intents = gr.base_bars, gr.intents
-    assert len(bars) == len(intents)
+    log.info("backtest %s start %s -> %s interval=%s params=%s", dep.label, start.date(), end.date(),
+             dep.base_tf or "default", p)
     cfg = dep.sim_config()
+    trades_ = _trade_states(fsa)
     if "capital" not in dep.sim:
-        cfg.capital = graph.trader.notional           # compare like with like: the order size is the money at work
-    sim = simulate(bars, intents, cfg, trade_from=start)
-
-    s_idx = int(bars.index.searchsorted(start))
-    eq = sim.equity.iloc[s_idx:]
-    if len(eq) < 5:
+        # fixed $ orders: the order size is the money at work; % orders: a real account, like a local live DAG
+        cfg.capital = PCT_ACCOUNT_CASH if any(t.size for t in trades_) else max(t.notional for t in trades_)
+    kw = dict(base_tf=dep.base_tf, cfg=cfg, inputs=dep.inputs, flat_by_close=dep.flat_by_close,
+              start_at=dep.start_at, label=dep.label, data_start=dep.data_start(fsa))
+    res = backtest(fsa, data, dep.ticker, start, end, progress=progress, **kw)
+    check()
+    bars, base_tf = res.bars, res.base_tf
+    s_idx = res.start_idx
+    if len(bars) - s_idx < 5:
         raise ValueError(f"no bars at/after start {dep.start} for {dep.ticker} - check dates and data availability")
-    exposure = sim.exposure.iloc[s_idx:]
-    trades = sim.trades
-
-    ed = daily_equity(eq, base_tf)
-    first = ed.index[0] - pd.Timedelta(days=1)
-    ed = pd.concat([pd.Series({first: cfg.capital}), ed]).rename("strategy")
-    ed.index = pd.DatetimeIndex(ed.index)
-    metrics: dict = {"strategy": equity_stats(ed), "trades": trade_stats(trades, exposure)}
-
-    # benchmarks over the same dates
-    bench = {}
+    # Results come ONLY from the fills (the same ledger the live dashboard uses).
+    bench_close = {}
     for key, sym in (("buy_hold", dep.ticker), ("spy", dep.benchmark)):
         try:
-            b = _rebase(_daily_close(data, sym, start, end), ed.index[1:], cfg.capital)
-            b = pd.concat([pd.Series({first: cfg.capital}), b])
-            bench[key] = b.reindex(ed.index).ffill().rename(key)
-            metrics[key] = equity_stats(bench[key])
+            bench_close[key] = _daily_close(data, sym, start, end)
         except Exception as e:  # noqa: BLE001
             log.warning("benchmark %s unavailable: %s", sym, e)
-    if "spy" in bench:
-        metrics["vs_spy"] = relative_stats(ed, bench["spy"])
-    if "buy_hold" in bench:
-        metrics["vs_buy_hold"] = relative_stats(ed, bench["buy_hold"])
-    metrics["split"] = split_stats(ed, trades, dep.holdout, base_tf)
-    close_eval = bars["close"].iloc[s_idx:]
-    metrics["baseline"] = random_timing_baseline(close_eval, exposure, metrics["strategy"].get("total_return", 0.0),
-                                                 cost_bps=2 * (cfg.commission_bps + cfg.slippage_bps))
+    led = ledger_report(res.fills, bars, cfg.capital, base_tf, start=start, benchmarks=bench_close,
+                        holdout=dep.holdout, cost_bps=2 * (cfg.commission_bps + cfg.slippage_bps))
+    metrics = led.metrics
+    tnames = {t.name for t in trades_}
+    metrics["fsa"] = {"transitions": len(res.events),
+                      "entries_not_filled": sum(1 for e in res.events if e["from"] in tnames and e["outcome"] == "fail"),
+                      "max_wait_expiries": sum(1 for e in res.events if e["outcome"] == "max_wait")}
     insights = insights_for(metrics, dep)
 
     causal_msg = None
     if check_causal:
-        rep = verify_causal(graph, data, dep.ticker, data_start, end, base_tf=dep.base_tf)
+        rep = verify_causal(lambda: build_fsa(dep, params)[0], data, dep.ticker, start, end, **kw)
         causal_msg = str(rep)
         if not rep.ok:
             insights.insert(0, causal_msg)
 
     now = datetime.now(timezone.utc)
-    run_id = run_id or f"{dep.strategy}_{dep.ticker}_{now.strftime('%Y%m%d-%H%M%S')}"
-    base_grid = pd.DatetimeIndex(bars["avail"])
-    nodes_df, node_info = node_frame(gr, base_grid, bars["close"])
-    nodes_df.index = bars.index                       # plot values at the bar they refer to
+    run_id = run_id or f"{dep.strategy}_{dep.ticker}_{base_tf}_{now.strftime('%Y%m%d-%H%M%S')}"
+    nodes_df, node_info = node_frame(fsa, res.trace, bars["close"].iloc[s_idx:])
     meta = {"id": run_id, "strategy": dep.strategy, "ticker": dep.ticker, "created": now.isoformat(),
-            "start": dep.start, "end": str(end.date()), "base_tf": base_tf, "params": p, "benchmark": dep.benchmark,
-            "sim": dep.sim_config().__dict__, "holdout": dep.holdout, "metrics": metrics, "insights": insights,
-            "dag": graph.describe(dep.base_tf), "node_info": node_info, "causal": causal_msg,
+            "start": dep.start, "end": str(end.date()), "base_tf": base_tf, "flat_by_close": dep.flat_by_close,
+            "size": next((t.size for t in trades_ if t.size), None), "capital": cfg.capital, "params": p,
+            "inputs": dep.inputs, "start_at": dep.start_at, "benchmark": dep.benchmark,
+            "sim": cfg.__dict__, "holdout": dep.holdout, "metrics": metrics, "insights": insights,
+            "dag": fsa.describe(base_tf), "node_info": node_info, "causal": causal_msg,
+            "events": [{**e, "t": int(e["t"])} for e in res.events[-2000:]],
             "description": getattr(load_strategy(dep.strategy, root=dep.path.parent.parent.parent if dep.path else None),
                                    "DESCRIPTION", "")}
     meta.update(extra_meta or {})
-    out = RunOutput(run_id, dep, gr, sim, metrics, insights, meta)
+    out = RunOutput(run_id, dep, res, led, metrics, insights, meta)
+    s_ = metrics["strategy"]
+    log.info("backtest %s done in %.1fs: return %+.2f%% sharpe %.2f maxDD %.1f%% trades %d transitions %d%s%s",
+             dep.label, _time.time() - t0, 100 * s_.get("total_return", 0), s_.get("sharpe", 0),
+             100 * s_.get("max_drawdown", 0), metrics["trades"]["n_trades"], len(res.events),
+             f" -> saved {run_id}" if save else "", f" | {causal_msg.splitlines()[0]}" if causal_msg else "")
+    check()
     if save:
         store = store or RunStore()
-        plot_bars = bars.iloc[max(s_idx - 100, 0):][["open", "high", "low", "close", "volume"]]
+        lo = max(s_idx - 100, 0)
         frames = {
-            "bars": plot_bars,
-            "equity": pd.DataFrame({"equity": sim.equity.iloc[s_idx:], "exposure": exposure}),
-            "daily": pd.concat([ed] + list(bench.values()), axis=1),
-            "trades": trades, "fills": sim.fills,
-            "nodes": nodes_df.iloc[max(s_idx - 100, 0):],
+            "bars": bars.iloc[lo:][["open", "high", "low", "close", "volume"]],
+            "equity": pd.DataFrame({"equity": led.equity, "exposure": led.exposure}),
+            "daily": led.daily,
+            "trades": led.trades, "fills": res.fills,
+            "nodes": nodes_df.reindex(bars.index[lo:]),       # same rows as the plotted candles
         }
         store.save(run_id, meta, frames)
     return out

@@ -1,3 +1,4 @@
-from .broker import SimConfig, SimResult, build_trades, simulate
+from .broker import SimConfig, build_trades
+from .paper import PaperBroker
 
-__all__ = ["SimConfig", "SimResult", "build_trades", "simulate"]
+__all__ = ["SimConfig", "build_trades", "PaperBroker"]

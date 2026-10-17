@@ -9,13 +9,19 @@
 <body>
 <header class="top">
   <a class="brand" href="#/" id="brand">dag<b>trade</b></a>
-  <nav><a class="navlink" href="#/">Backtests</a><a class="navlink" href="#/live">Live <i id="livedot" class="dot"></i></a></nav>
+  <nav><a class="navlink" data-route="dags" href="#/">DAGs</a><a class="navlink" data-route="backtests" href="#/backtests">Backtests</a><a class="navlink" data-route="live" href="#/live">Live <i id="livedot" class="dot"></i></a><a class="navlink" data-route="logs" href="#/logs">Logs</a></nav>
   <span class="crumb" id="crumb"></span>
   <span class="grow"></span>
   <button class="ghost" id="theme" title="Toggle light / dark">◐</button>
 </header>
 <main id="app"></main>
 <script src="/static/lightweight-charts.js"></script>
-<script src="/static/app.js"></script>
+<script src="/static/js/core.js"></script>
+<script src="/static/js/run.js"></script>
+<script src="/static/js/backtests.js"></script>
+<script src="/static/js/live.js"></script>
+<script src="/static/js/dags.js"></script>
+<script src="/static/js/logs.js"></script>
+<script src="/static/js/main.js"></script>
 </body>
 </html>

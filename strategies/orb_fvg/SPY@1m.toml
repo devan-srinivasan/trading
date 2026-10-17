@@ -1,0 +1,3 @@
+# Day trading on 1-minute candles (needs Alpaca keys for this much 1m history).
+start = "2025-10-17"
+flat_by_close = true

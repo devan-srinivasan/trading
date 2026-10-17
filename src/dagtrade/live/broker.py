@@ -27,6 +27,7 @@ class Broker(Protocol):
                      take: float | None = None, limit: float | None = None) -> BOrder: ...   # carries its own exits
     def submit_market(self, symbol: str, side: str, qty: int, client_id: str) -> BOrder: ...
     def cancel(self, order_id: str) -> None: ...
+    def replace_stop(self, order_id: str, stop: float) -> None: ...   # move a stop-loss leg (trailing stops)
 
 
 def _f(x) -> float | None:
@@ -56,9 +57,12 @@ class AlpacaBroker:
     def __init__(self, key: str | None = None, secret: str | None = None, client=None):
         if client is None:
             from alpaca.trading.client import TradingClient
-            key, secret = key or os.getenv("ALPACA_KEY"), secret or os.getenv("ALPACA_SECRET")
+            from ..data.providers import alpaca_keys
+            k, sec = alpaca_keys()
+            key, secret = key or k, secret or sec
             if not (key and secret):
-                raise RuntimeError("ALPACA_KEY / ALPACA_SECRET not set (use your PAPER account keys; see .env.example)")
+                raise RuntimeError("Alpaca keys not found: set ALPACA_KEY and ALPACA_SECRET in .env (PAPER account keys; "
+                                   "see .env.example)")
             client = TradingClient(key, secret, paper=True)       # paper=True is hard-wired on purpose
         self.client = client
 
@@ -124,6 +128,10 @@ class AlpacaBroker:
     def cancel(self, order_id: str) -> None:
         self.client.cancel_order_by_id(order_id)
 
+    def replace_stop(self, order_id: str, stop: float) -> None:
+        from alpaca.trading.requests import ReplaceOrderRequest
+        self.client.replace_order_by_id(order_id, ReplaceOrderRequest(stop_price=round(float(stop), 2)))
+
 
 class DryRunBroker:
     """Wraps a real (read-only) broker: reads pass through, writes are logged and pretend to succeed."""
@@ -149,3 +157,6 @@ class DryRunBroker:
 
     def cancel(self, order_id: str) -> None:
         log.info("[dry-run] would cancel order %s", order_id)
+
+    def replace_stop(self, order_id: str, stop: float) -> None:
+        log.info("[dry-run] would move stop of %s to %.2f", order_id, stop)

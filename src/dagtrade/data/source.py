@@ -27,6 +27,17 @@ def _ts(x) -> pd.Timestamp:
     return t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
 
 
+def _chunks(a: pd.Timestamp, b: pd.Timestamp, tf: str) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Split a download into pieces (a month of intraday candles, 10 years of daily) so it can report progress
+    and be cancelled between requests."""
+    step = pd.Timedelta(days=30) if tfm.is_intraday(tf) else pd.Timedelta(days=3650)
+    out = []
+    while a < b:
+        out.append((a, min(a + step, b)))
+        a = out[-1][1]
+    return out
+
+
 class BarStore:
     """Parquet cache: data/bars/<TICKER>/<tf>.parquet + <tf>.json (covered range, since holidays leave gaps)."""
 
@@ -58,6 +69,9 @@ class DataSource:
         self.providers = providers if providers is not None else default_providers()
         self.store = store or BarStore()
         self.fetch_missing = fetch_missing
+        # optional callback(label, done, total) between download chunks; it may raise to abort (cancel a backtest).
+        # An aborted download caches nothing, so the cache never holds half a range.
+        self.on_chunk = None
 
     # -- fetching ---------------------------------------------------------------------------
     def _fetch(self, ticker, tf, start, end) -> pd.DataFrame:
@@ -91,7 +105,15 @@ class DataSource:
                 gaps.append((cov[1] - pd.Timedelta(days=3), end))
         if not gaps or not self.fetch_missing:
             return
-        frames = [have] + [self._fetch(ticker, tf, a, b) for a, b in gaps]
+        log.info("data %s %s: fetching %s", ticker, tf, ", ".join(f"{a:%Y-%m-%d %H:%M}->{b:%Y-%m-%d %H:%M}" for a, b in gaps))
+        chunks = [c for a, b in gaps for c in _chunks(a, b, tf)]
+        frames = [have]
+        for k, (a, b) in enumerate(chunks):
+            if self.on_chunk:
+                self.on_chunk(f"downloading {ticker} {tf} candles", k, len(chunks))
+            frames.append(self._fetch(ticker, tf, a, b))
+        if self.on_chunk:
+            self.on_chunk(f"downloading {ticker} {tf} candles", len(chunks), len(chunks))
         df = pd.concat([f for f in frames if len(f)]) if any(len(f) for f in frames) else have
         df = df[~df.index.duplicated(keep="last")].sort_index()
         # never cache bars that have not finished forming

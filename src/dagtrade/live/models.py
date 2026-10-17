@@ -54,6 +54,4 @@ class BClock:
     next_close: datetime
 
 
-def slug(label: str) -> str:
-    """strategy/TICKER -> a client-order-id-safe token."""
-    return "".join(ch if ch.isalnum() else "-" for ch in label)
+from ..fsa.planner import slug  # noqa: E402,F401  (one definition, shared with the backtest engine)

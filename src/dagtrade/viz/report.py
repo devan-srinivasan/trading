@@ -17,13 +17,12 @@ def write_report(run_id: str, out: str | None = None) -> Path:
     html = (STATIC / "index.html").read_text()
     css = (STATIC / "style.css").read_text()
     html = html.replace('<link rel="stylesheet" href="/static/style.css">', f"<style>{css}</style>")
-    for name in ("lightweight-charts.js", "app.js"):
+    scripts = ["lightweight-charts.js", "js/core.js", "js/run.js", "js/backtests.js", "js/live.js", "js/dags.js", "js/logs.js", "js/main.js"]
+    blob = json.dumps(payload).replace("</", "<\\/")
+    for name in scripts:
         tag = f'<script src="/static/{name}"></script>'
         js = (STATIC / name).read_text().replace("</script>", "<\\/script>")
-        data = ""
-        if name == "app.js":
-            blob = json.dumps(payload).replace("</", "<\\/")
-            data = f"<script>window.STATIC_RUN = {blob};</script>"
+        data = f"<script>window.STATIC_RUN = {blob};</script>" if name == "js/core.js" else ""
         html = html.replace(tag, f"{data}<script>{js}</script>")
     path = Path(out) if out else project_root() / "runs" / run_id / "report.html"
     path.write_text(html)
